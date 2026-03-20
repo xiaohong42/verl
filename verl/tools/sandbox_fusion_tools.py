@@ -145,7 +145,7 @@ class SandboxFusionTool(BaseTool):
             rate_limit=self.rate_limit,
             mode=PoolMode.ThreadMode,
         )
-        self._thread_semaphore = threading.Semaphore(self.num_workers)
+        self._async_semaphore = asyncio.Semaphore(self.num_workers)
         self.sandbox_fusion_url = config.get("sandbox_fusion_url", "")
         self.memory_limit_mb = config.get("memory_limit_mb", 1024)
         if self.sandbox_fusion_url == "":
@@ -179,15 +179,10 @@ class SandboxFusionTool(BaseTool):
         if self.use_ray_execution_pool:
             result = await self.execution_pool.execute.remote(self.execute_code, instance_id, code, timeout, language)
         else:
-            # Bypass Ray IPC: run blocking HTTP call directly in a thread pool,
-            # using a semaphore to limit concurrency (same as num_workers).
-            self._thread_semaphore.acquire()
-            try:
+            async with self._async_semaphore:
                 result = await asyncio.get_running_loop().run_in_executor(
                     None, self.execute_code, instance_id, code, timeout, language
                 )
-            finally:
-                self._thread_semaphore.release()
         # sandbox has no score or metrics, use Nones
         if isinstance(result, ToolResponse):
             return result, None, None
