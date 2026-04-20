@@ -159,7 +159,7 @@ class BucketedWeightSender:
             ipc_path = self.zmq_handle[len("ipc://") :]
             try:
                 os.remove(ipc_path)
-            except FileNotFoundError:
+            except OSError:
                 pass
         self.socket = self.zmq_context.socket(zmq.REQ)
         self.socket.bind(self.zmq_handle)
@@ -195,7 +195,7 @@ class BucketedWeightSender:
             ipc_path = self.zmq_handle[len("ipc://") :]
             try:
                 os.remove(ipc_path)
-            except FileNotFoundError:
+            except OSError:
                 pass
         del self.buffer
         self.buffer = None
