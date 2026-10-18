@@ -53,7 +53,7 @@ use_remove_padding=True
 use_dynamic_bsz=True
 max_prompt_length=${max_prompt_length:-$((1024 * 2))}
 max_response_length=${max_response_length:-$((1024 * 30))}
-actor_max_token_len_per_gpu=$(((max_prompt_length + max_response_length) / usp_size))
+actor_max_token_len_per_gpu=${actor_max_token_len_per_gpu:-$(((max_prompt_length + max_response_length) / usp_size))}
 
 # Inference config
 rollout_name=vllm
