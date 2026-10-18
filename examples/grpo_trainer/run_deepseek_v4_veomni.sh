@@ -9,11 +9,11 @@
 set -xeuo pipefail
 
 # ---- user-adjustable ----
-n_gpus_per_node=8
-trainer_nnodes=8
+n_gpus_per_node=${n_gpus_per_node:-8}
+trainer_nnodes=${trainer_nnodes:-8}
 
-project_name='wuxibin_dapo'
-exp_name='deepseek_v4_flash_base_ep8_sp2_qat_0826b'
+project_name=${project_name:-'wuxibin_dapo'}
+exp_name=${exp_name:-'deepseek_v4_flash_base_ep8_sp2_qat_0826b'}
 
 # ===================================== Algorithm =====================================
 adv_estimator=grpo
@@ -35,15 +35,15 @@ gae_lam=0.95
 critic_warmup=0
 
 # ===================================== Data/Model =====================================
-model_path=$HDFS_ROOT/model/deepseek-ai/DeepSeek-V4-Flash-Base
-train_files=$DATA_ROOT/dataset/BytedTsinghua-SIA/DAPO-Math-17k/data/dapo-math-17k.parquet
-test_files=$DATA_ROOT/dataset/aime25_test.parquet
-checkpoint_dir=$DATA_ROOT/checkpoint/$project_name/$exp_name
+model_path=${model_path:-$HDFS_ROOT/model/deepseek-ai/DeepSeek-V4-Flash-Base}
+train_files=${train_files:-$DATA_ROOT/dataset/BytedTsinghua-SIA/DAPO-Math-17k/data/dapo-math-17k.parquet}
+test_files=${test_files:-$DATA_ROOT/dataset/aime25_test.parquet}
+checkpoint_dir=${checkpoint_dir:-$DATA_ROOT/checkpoint/$project_name/$exp_name}
 
-train_batch_size=128
-ppo_mini_batch_size=64
-n_resp_per_prompt=8
-n_resp_per_prompt_val=16
+train_batch_size=${train_batch_size:-128}
+ppo_mini_batch_size=${ppo_mini_batch_size:-64}
+n_resp_per_prompt=${n_resp_per_prompt:-8}
+n_resp_per_prompt_val=${n_resp_per_prompt_val:-16}
 enable_thinking=${enable_thinking:-True}
 
 # Training config
@@ -51,25 +51,25 @@ usp_size=${usp_size:-4}
 expert_size=${expert_size:-8}
 use_remove_padding=True
 use_dynamic_bsz=True
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 30))
-actor_max_token_len_per_gpu=$(((max_prompt_length + max_response_length) / usp_size))
+max_prompt_length=${max_prompt_length:-$((1024 * 2))}
+max_response_length=${max_response_length:-$((1024 * 30))}
+actor_max_token_len_per_gpu=${actor_max_token_len_per_gpu:-$(((max_prompt_length + max_response_length) / usp_size))}
 
 # Inference config
 rollout_name=vllm
-infer_tp=8
-infer_dp=1
-infer_ep=1
-gpu_memory_utilization=0.6
+infer_tp=${infer_tp:-8}
+infer_dp=${infer_dp:-1}
+infer_ep=${infer_ep:-1}
+gpu_memory_utilization=${gpu_memory_utilization:-0.6}
 # ---- end user-adjustable ----
 
 # ---- no user adjustment needed below ----
 # VeOmni config
 ENGINE_CONFIG=(
     model_engine=veomni
-    actor_rollout_ref.actor.veomni.enable_fsdp_offload=True
-    # actor_rollout_ref.actor.veomni.param_offload=True
-    # actor_rollout_ref.actor.veomni.optimizer_offload=True
+    actor_rollout_ref.actor.veomni.enable_fsdp_offload=${enable_fsdp_offload:-True}
+    actor_rollout_ref.actor.veomni.param_offload=${param_offload:-False}
+    actor_rollout_ref.actor.veomni.optimizer_offload=${optimizer_offload:-False}
     actor_rollout_ref.actor.veomni.enable_async_activation_offload=True
     actor_rollout_ref.actor.veomni.enable_full_shard=True
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=$usp_size
@@ -141,19 +141,19 @@ DATA=(
 
 TRAINER=(
     trainer.critic_warmup=$critic_warmup
-    trainer.logger=['console','wandb']
+    trainer.logger=${logger:-['console','wandb']}
     trainer.project_name=$project_name
     trainer.experiment_name=$exp_name
     trainer.n_gpus_per_node=${n_gpus_per_node}
     trainer.nnodes=$trainer_nnodes
     trainer.val_before_train=False
     trainer.log_val_generations=100
-    trainer.save_freq=20
-    trainer.test_freq=20
+    trainer.save_freq=${save_freq:-20}
+    trainer.test_freq=${test_freq:-20}
     trainer.max_actor_ckpt_to_keep=2
     trainer.default_local_dir=$checkpoint_dir
     trainer.total_epochs=10
-    trainer.total_training_steps=500
+    trainer.total_training_steps=${total_training_steps:-500}
 )
 
 ########################### launch ###########################
