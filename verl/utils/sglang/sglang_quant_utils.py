@@ -161,6 +161,9 @@ def set_default_sglang_quantization_backends(
     """Default supported FP8/MXFP8/MXFP4 backends to DeepGEMM."""
     if quantization_config is None or _is_nvfp4_quantization(quantization_config):
         return
+    # DeepGEMM is NVIDIA-only; on ROCm, SGLang's automatic selection picks the AITER / Triton kernels.
+    if torch.version.hip is not None:
+        return
     for option in ("fp8_gemm_runner_backend", "moe_runner_backend"):
         engine_kwargs.setdefault(option, "deep_gemm")
 

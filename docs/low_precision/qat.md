@@ -1,6 +1,6 @@
 # Low-Precision Rollout and Quantization-Aware Training
 
-Last updated: 10/25/2026
+Last updated: 10/28/2026
 
 In RL training, rollout usually dominates the step time, and for large MoE models it is bound by memory capacity and bandwidth. Running rollout in low precision:
 
@@ -186,7 +186,9 @@ Its `ignore_patterns` use Megatron module names and `fnmatch` syntax. Keep them 
   all other cases retain vLLM's architecture-specific default.
 - **SGLang**: quantized FP8/MXFP8/MXFP4 rollouts similarly default
   `fp8_gemm_runner_backend` and `moe_runner_backend` to `deep_gemm`. Explicit
-  values under `engine_kwargs.sglang` take precedence.
+  values under `engine_kwargs.sglang` take precedence. On AMD ROCm, which has
+  no DeepGEMM, verl sets neither option and SGLang selects its AITER or Triton
+  kernels.
 - **vLLM MXFP4**: vLLM 0.29's compressed-tensors path otherwise ignores the
   requested expert activation scheme. verl routes MXFP4 experts through the
   DeepGEMM FP4 backend, whose dynamic FP8 activations use group size 128.
