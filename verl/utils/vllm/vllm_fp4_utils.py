@@ -122,6 +122,11 @@ def install_mxfp4_mxfp8_compressed_tensors_patch():
         weight_quant = None if scheme is None else scheme.get("weights")
         input_quant = None if scheme is None else scheme.get("input_activations")
         if quant_config._is_mxfp4(weight_quant) and quant_config._is_mxfp8(input_quant):
+            if torch.version.hip is not None:
+                from verl.utils.vllm.vllm_fp4_rocm_utils import make_rocm_aiter_mxfp4_moe_method
+
+                logger.info("Using MXFP4 weights with MXFP8 activations for compressed-tensors MoE (AITER a8w4)")
+                return make_rocm_aiter_mxfp4_moe_method(layer.moe_config)
             logger.info("Using MXFP4 weights with dynamic MXFP8 activations for compressed-tensors MoE")
             return CompressedTensorsW4A8Mxfp4MoEMethod(layer.moe_config)
         return original(quant_config, layer, layer_name)

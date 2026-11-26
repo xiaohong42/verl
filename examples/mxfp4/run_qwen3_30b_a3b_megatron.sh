@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-30B-A3B (MoE) | DAPO-Math-17k | Megatron training | MXFP4 routed experts | NVIDIA Blackwell (SM100+)
+# GRPO | Qwen3-30B-A3B (MoE) | DAPO-Math-17k | Megatron training | MXFP4 routed experts | NVIDIA Blackwell (SM100+), AMD gfx950
 #
 # PRECISION=mxfp4_qat trains in BF16 with ModelOpt MXFP4 QAT on the routed experts and serves the rollout with MXFP4
 # experts; PRECISION=mxfp4 quantizes the rollout's experts only (no QAT); PRECISION=bf16 runs the same job in BF16, as
 # the baseline. MXFP4 covers the routed experts only: dense layers, lm_head, embeddings and routers stay in BF16.
-# The rollout serves the experts through vLLM's DeepGEMM FP4 MoE kernel, which needs SM100/SM120. The defaults were
-# tested on one 4xB300 node (4xB200 untested) and run without a validation set. See docs/low_precision/mxfp4_qat.md.
+# The rollout serves the experts through vLLM's DeepGEMM FP4 MoE kernel, which needs SM100/SM120; on AMD gfx950
+# (MI350X/MI355X) it serves them through AITER's a8w4 fused MoE. The defaults were tested on one 4xB300 node (4xB200
+# untested) and on one 4xMI350X node, and run without a validation set. See docs/low_precision/mxfp4_qat.md.
 
 set -xeuo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -62,7 +63,7 @@ case "${PRECISION}" in
     mxfp4_qat)
         PRECISION_ARGS=(
             # MXFP4 rollout experts: verl exports MXFP4 expert weights (1x32 groups, E8M0 scales); DeepGEMM quantizes the
-            # expert activations to FP8 (1x128) at run time
+            # expert activations to FP8 (1x128) at run time, AITER on ROCm to FP8 in 1x32 blocks
             actor_rollout_ref.rollout.quantization.moe=MXFP4
             # ModelOpt QAT fake-quantizes the routed experts the same way during training (MXFP4 weights, MXFP8 inputs)
             actor_rollout_ref.actor.megatron.qat.enable=True
@@ -82,6 +83,14 @@ case "${PRECISION}" in
         exit 1
         ;;
 esac
+
+# ROCm: ModelOpt's QAT turns off fused wgrad accumulation on the quantized expert linears, which makes Transformer
+# Engine run them on its Triton grouped GEMM where NVTE_USE_GROUPED_GEMM_TRITON=1 (as verl's ROCm image sets). Before
+# TE 2.21 its gfx950 configs for these shapes need more shared memory than the GPU has, so QAT keeps TE's default
+# grouped GEMM, the one the BF16 arm runs on
+if [ -e /dev/kfd ] && [[ "${PRECISION}" == *_qat ]]; then
+    export NVTE_USE_GROUPED_GEMM_TRITON=0
+fi
 
 DATA=(
     algorithm.adv_estimator=grpo

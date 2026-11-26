@@ -1,4 +1,4 @@
-# MXFP4 MoE QAT on Blackwell
+# MXFP4 MoE QAT on Blackwell and AMD Instinct
 
 Last updated: 11/26/2026
 
@@ -15,7 +15,8 @@ in [Low-Precision Rollout and Quantization-Aware Training](qat.md). For MXFP8 en
 ## Requirements
 
 - Blackwell GPUs for the rollout: the MXFP4-weight × FP8-activation experts are served by vLLM's DeepGEMM FP4 MoE
-  kernel (SM100/SM120). Hopper has no such kernel and is outside this recipe; see [qat.md](qat.md).
+  kernel (SM100/SM120). Hopper has no such kernel and is outside this recipe; see [qat.md](qat.md). On AMD, gfx950
+  (MI350X, MI355X) serves them with AITER instead; see [AMD Instinct (ROCm)](#amd-instinct-rocm).
 - Training: the Megatron-Bridge model path; QAT uses NVIDIA ModelOpt.
 - Rollout: vLLM (the version verl locks).
 
@@ -116,3 +117,46 @@ Results and observations:
 - The MXFP4 rollout does not speed this job up: generation takes about as long as in BF16 (+6 s) and the expert
   export adds about 10 s per step.
 - Ten steps are enough for speed and mismatch, not for the score.
+
+## AMD Instinct (ROCm)
+
+On ROCm the trainer-side MXFP4 quantization runs AITER's MXFP4 quantizer (see the notes above), and the rollout
+serves MXFP4 experts with MXFP8 inputs (`moe: MXFP4`) through AITER's a8w4 fused MoE instead of DeepGEMM. AITER
+quantizes both expert GEMM inputs to FP8 in 1x32 blocks with E8M0 scales, the grid of the QAT input fake quant. The
+expert weights stay registered in their compressed-tensors checkpoint layout: vLLM's reload writes each weight update
+into them and then refreshes AITER's shuffled copies in place.
+
+- GPUs: gfx950 (MI350X, MI355X). AITER's a8w4 MoE does not compile on gfx942, and verl refuses the MXFP4 × MXFP8
+  rollout there.
+- ModelOpt's QAT turns off fused wgrad accumulation on the quantized expert linears, so Transformer Engine runs them
+  on its Triton grouped GEMM where `NVTE_USE_GROUPED_GEMM_TRITON=1`, as verl's ROCm image sets. Before Transformer
+  Engine 2.21 its gfx950 configs for these shapes need more shared memory than the GPU has; the example script sets
+  the variable to `0` for its QAT arms on ROCm, so they run on TE's default grouped GEMM, like the BF16 arm.
+
+### Results on MI350X
+
+**Configuration**
+
+- The example script on one 4×MI350X node per arm, the same seed and data order; the arms ran on different hosts, so
+  their step times are not compared here
+- The script's defaults plus token-level TIS (`algorithm.rollout_correction.rollout_is=token`), R3 router replay
+  (`actor_rollout_ref.actor.megatron.router_replay.mode=R3`, `actor_rollout_ref.rollout.enable_rollout_routing_replay=True`)
+  and `actor_rollout_ref.rollout.free_cache_engine=False`: on some of these hosts, vLLM's sleep mode fails in
+  `hipMemUnmap` with `invalid argument`, a HIP runtime regression in the image's ROCm 10.2 nightly
+  (ROCm/rocm-systems#11606, fixed by ROCm/rocm-systems#13562); `rocm/primus:v26.10` has the fix, and the script's
+  default works there;
+  DAPO-Math-17k as `prepare_dapo_data.sh` downloads it, not deduplicated
+- `rocm/primus:v26.9` (ROCm 10.2 nightly, PyTorch 2.16 pre-release) with vLLM 0.34.0, Transformer Engine 2.20.0.dev0,
+  Megatron-Core 0.19.2, Megatron-Bridge 0.6.2, ModelOpt 0.48.0 and AITER 0.1.27; verl main `de742368` with these
+  changes, before weight updates moved onto vLLM's reload (#8780)
+
+| mean of steps 2–119 | BF16/BF16 | BF16+QAT/MXFP4 |
+|---|---|---|
+| `rollout_corr/kl` | 0.00073 | 0.0024 |
+| tokens with TIS ratio > 2 | 2.4e-5 | 4.2e-4 |
+| score | 0.33 | 0.31 |
+| entropy | 0.135 | 0.143 |
+
+- The QAT arm's `rollout_corr/kl` is 3.3× the BF16 arm's and rises slowly over the run (0.0017–0.0029 per step; 0.0021
+  on average over steps 2–58, 0.0026 over steps 50–119). Score, entropy and response length follow the BF16 arm with
+  no divergence, through step 119 (the BF16 arm's last) and to the QAT arm's last step, 127.
