@@ -1,6 +1,6 @@
 # MXFP4 MoE QAT on Blackwell
 
-Last updated: 11/06/2026
+Last updated: 11/26/2026
 
 MXFP4 is the OCP microscaling FP4 format: E2M1 elements with one E8M0 scale per 32-element block. In verl it covers
 the routed experts of MoE models. The rollout serves MXFP4 expert weights, quantized on the trainer side, and
@@ -38,8 +38,10 @@ Notes:
 - `lm_head`, the token embedding, MoE routers and every dense layer stay in BF16 on the rollout and in training.
 - ModelOpt installs the fake quantizers; they run verl's TileLang MXFP4 kernel, the one the trainer-side exporter
   uses without dequantization, so the QAT forward and the exported rollout weights agree bit for bit (see
-  [qat.md](qat.md)). The experts' inputs are fake-quantized to MXFP8 (1x32 blocks), while the rollout's DeepGEMM
-  kernel quantizes them to FP8 in 1x128 groups with E8M0 scales.
+  [qat.md](qat.md)). On ROCm, where TileLang cannot run these MXFP4 kernels, both go to AITER's MXFP4 quantizer in
+  its ceil scaling mode, the same recipe bit for bit (`verl/utils/qat/fp4_rocm.py`). The experts' inputs are
+  fake-quantized to MXFP8 (1x32 blocks), while the rollout's DeepGEMM kernel quantizes them to FP8 in 1x128 groups
+  with E8M0 scales.
 - QAT quantizes the Transformer Engine modules of the layer spec that Megatron-Bridge builds for the model, the
   grouped expert linears included, so tensor and expert parallelism can be combined. All expert weights of a grouped
   linear are fake-quantized in one kernel launch.
