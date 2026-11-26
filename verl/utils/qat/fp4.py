@@ -190,6 +190,11 @@ def fp4_grouped_fake_quant(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
     if cols == 0 or cols % MXFP4_GROUP_SIZE:
         raise ValueError(f"the last dimension must be a nonzero multiple of {MXFP4_GROUP_SIZE}, got {cols}")
 
+    if torch.version.hip is not None:
+        from verl.utils.qat import fp4_rocm
+
+        return fp4_rocm.fp4_grouped_fake_quant(tensors)
+
     pointer_table = torch.tensor(
         [tensor.data_ptr() for tensor in tensors],
         dtype=torch.int64,
@@ -229,6 +234,11 @@ def fp4_quant(
         raise ValueError(
             f"the last dimension must be a nonzero multiple of {MXFP4_GROUP_SIZE}, got shape {tuple(x.shape)}"
         )
+
+    if torch.version.hip is not None:
+        from verl.utils.qat import fp4_rocm
+
+        return fp4_rocm.fp4_quant(x, dequant=dequant)
 
     x = x.contiguous()
     scale_shape = (*x.shape[:-1], cols // MXFP4_GROUP_SIZE)
