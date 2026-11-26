@@ -18,8 +18,6 @@ import torch.nn.functional as F
 
 if torch.version.hip is None or not torch.cuda.is_available():
     pytest.skip("the AITER MXFP4 MoE runs on ROCm GPUs only", allow_module_level=True)
-if "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
-    pytest.skip("AITER's a8w4 MoE runs on gfx950 only", allow_module_level=True)
 pytest.importorskip("aiter")
 pytest.importorskip("vllm")
 
@@ -28,6 +26,7 @@ from verl.utils.vllm.vllm_fp4_rocm_utils import _method_class  # noqa: E402
 
 # Qwen3-30B-A3B's expert shapes under rollout TP2, with fewer experts
 NUM_EXPERTS, HIDDEN, INTERMEDIATE, TOP_K = 8, 2048, 384, 4
+ON_GFX950 = "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
 
 
 def _mxfp8_qdq(x: torch.Tensor) -> torch.Tensor:
@@ -87,12 +86,14 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return ((actual.float() - expected).norm() / expected.norm()).item()
 
 
+@pytest.mark.skipif(not ON_GFX950, reason="AITER's a8w4 MoE runs on gfx950 only")
 def test_a8w4_moe_matches_reference_and_reloads_in_place():
     generator = torch.Generator(device="cuda").manual_seed(0)
     w13, w2 = _experts(generator)
     layer = _layer(w13, w2)
     cls = _method_class()
     method = cls.__new__(cls)  # the kernel path needs no FusedMoEConfig
+    method.activation, method._unquantized = "fp8", None
     method.process_weights_after_loading(layer)
 
     x = torch.randn(256, HIDDEN, device="cuda", generator=generator).bfloat16()
@@ -109,3 +110,21 @@ def test_a8w4_moe_matches_reference_and_reloads_in_place():
     assert {name: getattr(layer, name).data_ptr() for name in live} == live
     output = method.apply(layer, x, topk_weights, topk_ids)
     assert _relative_error(output, _reference(x, new_w13, new_w2, topk_weights, topk_ids)) < 1e-2
+
+
+def test_w4a16_dequantizes_experts_into_bf16_parameters_in_place():
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    w13, w2 = _experts(generator)
+    layer = _layer(w13, w2)
+    for name, weight in (("w13_weight", w13), ("w2_weight", w2)):
+        dense = torch.empty_like(weight)
+        layer.register_parameter(name, torch.nn.Parameter(dense, requires_grad=False))
+    live = (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr())
+    cls = _method_class()
+    method = cls.__new__(cls)
+
+    method._dequantize_into_bf16(layer)
+
+    assert (layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr()) == live
+    assert torch.equal(layer.w13_weight, fp4_quant(w13, dequant=True))
+    assert torch.equal(layer.w2_weight, fp4_quant(w2, dequant=True))

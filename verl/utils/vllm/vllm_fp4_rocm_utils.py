@@ -15,12 +15,18 @@
 """Compressed-tensors MXFP4 routed experts on ROCm, served by AITER.
 
 DeepGEMM's FP4 MoE kernel is NVIDIA-only, and vLLM's ROCm MXFP4 backends cover gpt-oss checkpoints (interleaved
-gate/up, SwiGLU-OAI, static FP8 activation scales). verl's compressed-tensors experts (concatenated gate/up, SiLU)
-with MXFP8 inputs (``moe=MXFP4``, W4A8) run AITER's a8w4 fused MoE on gfx950. It quantizes both expert GEMM inputs
-to FP8 with one E8M0 scale per 32 values, ``2^ceil(log2(amax / 448))``: the grid of the QAT input fake quant.
+gate/up, SwiGLU-OAI, static FP8 activation scales). For verl's compressed-tensors experts (concatenated gate/up,
+SiLU):
+
+- MXFP4 weights with MXFP8 inputs (``moe=MXFP4``, W4A8) run AITER's a8w4 fused MoE on gfx950. It quantizes both
+  expert GEMM inputs to FP8 with one E8M0 scale per 32 values, ``2^ceil(log2(amax / 448))``: the grid of the QAT
+  input fake quant.
+- MXFP4 weights with BF16 inputs (``moe=MXFP4``, ``moe_activation=bf16``, W4A16): AITER's a16w4 SiLU MoE does not
+  keep BF16 activations on gfx950, so the experts are dequantized to BF16, which is exact, and run vLLM's
+  unquantized MoE: the kernel of the BF16 rollout.
 
 The checkpoint-layout parameters stay registered, so the initial load and every weight update write into them.
-``process_weights_after_loading``, which vLLM's reload runs again after each update, rewrites the AITER tensors in
+``process_weights_after_loading``, which vLLM's reload runs again after each update, rewrites the kernel tensors in
 place, keeping the addresses the captured graphs read.
 """
 
@@ -37,7 +43,20 @@ def _method_class():
     from vllm.model_executor.utils import set_weight_attrs
 
     class RocmAiterMxfp4MoEMethod(FusedMoEMethodBase):
-        """MXFP4 experts in compressed-tensors names with MXFP8 inputs, run by AITER's a8w4 fused MoE."""
+        """MXFP4 experts in compressed-tensors names, run by AITER (``activation="fp8"``) or dequantized to BF16."""
+
+        def __init__(self, moe, activation: str):
+            super().__init__(moe)
+            if activation not in ("fp8", "bf16"):
+                raise ValueError(f"activation must be fp8 or bf16, got {activation!r}")
+            self.activation = activation
+            self._unquantized = None
+            if activation == "bf16":
+                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                    UnquantizedFusedMoEMethod,
+                )
+
+                self._unquantized = UnquantizedFusedMoEMethod(moe)
 
         def create_weights(
             self,
@@ -72,20 +91,52 @@ def _method_class():
                 param = torch.nn.Parameter(torch.empty(shape, dtype=torch.uint8), requires_grad=False)
                 layer.register_parameter(name, param)
                 set_weight_attrs(param, attrs)
+            if self._unquantized is not None:
+                self._unquantized.create_weights(
+                    layer,
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    params_dtype,
+                    **extra_weight_attrs,
+                )
 
         def get_fused_moe_quant_config(self, layer):
+            if self._unquantized is not None:
+                return self._unquantized.get_fused_moe_quant_config(layer)
             return None
 
         @property
         def is_monolithic(self) -> bool:
+            if self._unquantized is not None:
+                return self._unquantized.is_monolithic
             return False
 
         @property
         def topk_indices_dtype(self):
+            if self._unquantized is not None:
+                return self._unquantized.topk_indices_dtype
             return torch.int32
 
         def process_weights_after_loading(self, layer) -> None:
+            if self._unquantized is not None:
+                self._dequantize_into_bf16(layer)
+                self._unquantized.process_weights_after_loading(layer)
+                self.moe_quant_config = self._unquantized.moe_quant_config
+                self.moe_kernel = self._unquantized.moe_kernel
+                return
             self._shuffle_for_aiter(layer)
+
+        @torch.no_grad()
+        def _dequantize_into_bf16(self, layer) -> None:
+            from verl.utils.qat.fp4_rocm import fp4_dequant
+
+            # straight into the BF16 parameters: no temporaries in vLLM's sleep-mode weights pool
+            for packed, scale, dense in (
+                (layer.w13_weight_packed, layer.w13_weight_scale, layer.w13_weight),
+                (layer.w2_weight_packed, layer.w2_weight_scale, layer.w2_weight),
+            ):
+                fp4_dequant(packed.data, scale.data, dense.dtype, out=dense.data)
 
         @torch.no_grad()
         def _shuffle_for_aiter(self, layer) -> None:
@@ -122,6 +173,15 @@ def _method_class():
                 live.copy_(tensor)
 
         def apply(self, layer, x, topk_weights, topk_ids, shared_experts=None, shared_experts_input=None):
+            if self._unquantized is not None:
+                return self._unquantized.apply(
+                    layer=layer,
+                    x=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
             from aiter import ActivationType, QuantType, dtypes
             from aiter.fused_moe import fused_moe
 
@@ -141,15 +201,19 @@ def _method_class():
                 gate_mode="interleave",
             )
 
+        def apply_monolithic(self, layer, x, router_logits, input_ids=None):
+            return self._unquantized.apply_monolithic(layer, x, router_logits, input_ids)
+
     return RocmAiterMxfp4MoEMethod
 
 
-def make_rocm_aiter_mxfp4_moe_method(moe):
-    """The ROCm MoE method for compressed-tensors MXFP4 experts with MXFP8 inputs (W4A8)."""
-    from vllm.platforms.rocm import on_gfx950
+def make_rocm_aiter_mxfp4_moe_method(moe, activation: str = "fp8"):
+    """The ROCm MoE method for compressed-tensors MXFP4 experts; ``activation`` is "fp8" (W4A8) or "bf16" (W4A16)."""
+    if activation == "fp8":
+        from vllm.platforms.rocm import on_gfx950
 
-    if not on_gfx950():
-        raise NotImplementedError(
-            "compressed-tensors MXFP4 experts with MXFP8 inputs run AITER's a8w4 fused MoE, which needs gfx950"
-        )
-    return _method_class()(moe)
+        if not on_gfx950():
+            raise NotImplementedError(
+                "compressed-tensors MXFP4 experts with MXFP8 inputs run AITER's a8w4 fused MoE, which needs gfx950"
+            )
+    return _method_class()(moe, activation)

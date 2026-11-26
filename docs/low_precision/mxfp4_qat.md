@@ -27,6 +27,7 @@ in [Low-Precision Rollout and Quantization-Aware Training](qat.md). For MXFP8 en
 actor_rollout_ref.rollout.quantization:
   linear: null
   moe: MXFP4
+  # moe_activation: bf16   # optional: BF16 expert inputs (W4A16), with qat.mode: mxfp4_w4a16
 
 # optional: MXFP4 QAT on the routed experts
 actor_rollout_ref.actor.megatron.qat:
@@ -47,6 +48,10 @@ Notes:
   grouped expert linears included, so tensor and expert parallelism can be combined. All expert weights of a grouped
   linear are fake-quantized in one kernel launch.
 - QAT and Transformer Engine FP8 training are mutually exclusive; the engine refuses the combination.
+- `moe_activation: bf16` serves the MXFP4 experts with BF16 inputs (W4A16), and the QAT mode `mxfp4_w4a16`
+  fake-quantizes only their weights; verl refuses a QAT mode that does not match the rollout quantization. The W4A16
+  rollout is implemented for ROCm (see [AMD Instinct (ROCm)](#amd-instinct-rocm)); on CUDA such experts are left to
+  vLLM's compressed-tensors MXFP4 MoE method, untested with verl.
 
 ## Example: Qwen3-30B-A3B on DAPO-Math-17k
 
@@ -128,6 +133,9 @@ into them and then refreshes AITER's shuffled copies in place.
 
 - GPUs: gfx950 (MI350X, MI355X). AITER's a8w4 MoE does not compile on gfx942, and verl refuses the MXFP4 × MXFP8
   rollout there.
+- W4A16 (`moe_activation: bf16`): AITER's a16w4 SiLU MoE does not keep BF16 activations on gfx950, so the rollout
+  dequantizes the experts to BF16, exactly, and runs vLLM's BF16 MoE kernel. W4A16 then matches the QAT numerics
+  but runs at the BF16 rollout's speed.
 - ModelOpt's QAT turns off fused wgrad accumulation on the quantized expert linears, so Transformer Engine runs them
   on its Triton grouped GEMM where `NVTE_USE_GROUPED_GEMM_TRITON=1`, as verl's ROCm image sets. Before Transformer
   Engine 2.21 its gfx950 configs for these shapes need more shared memory than the GPU has; the example script sets
@@ -137,8 +145,8 @@ into them and then refreshes AITER's shuffled copies in place.
 
 **Configuration**
 
-- The example script on one 4×MI350X node per arm, the same seed and data order; the arms ran on different hosts, so
-  their step times are not compared here
+- The example script on 4×MI350X per arm, the same seed and data order: the BF16 arm on one host, the two QAT arms on
+  the two halves of another host (sharing its CPUs), so only the QAT arms' step times are compared
 - The script's defaults plus token-level TIS (`algorithm.rollout_correction.rollout_is=token`), R3 router replay
   (`actor_rollout_ref.actor.megatron.router_replay.mode=R3`, `actor_rollout_ref.rollout.enable_rollout_routing_replay=True`)
   and `actor_rollout_ref.rollout.free_cache_engine=False`: on some of these hosts, vLLM's sleep mode fails in
@@ -150,13 +158,17 @@ into them and then refreshes AITER's shuffled copies in place.
   Megatron-Core 0.19.2, Megatron-Bridge 0.6.2, ModelOpt 0.48.0 and AITER 0.1.27; verl main `de742368` with these
   changes, before weight updates moved onto vLLM's reload (#8780)
 
-| mean of steps 2–119 | BF16/BF16 | BF16+QAT/MXFP4 |
-|---|---|---|
-| `rollout_corr/kl` | 0.00073 | 0.0024 |
-| tokens with TIS ratio > 2 | 2.4e-5 | 4.2e-4 |
-| score | 0.33 | 0.31 |
-| entropy | 0.135 | 0.143 |
+| mean of steps 2–119 | BF16/BF16 | BF16+QAT/MXFP4 W4A8 | BF16+QAT/MXFP4 W4A16 |
+|---|---|---|---|
+| `rollout_corr/kl` | 0.00073 | 0.0024 | 0.00073 |
+| tokens with TIS ratio > 2 | 2.4e-5 | 4.2e-4 | 2.5e-5 |
+| score | 0.33 | 0.31 | 0.31 |
+| entropy | 0.135 | 0.143 | 0.133 |
+| generation (s) | – | 146 | 172 |
+| step time (s) | – | 812 | 837 |
 
-- The QAT arm's `rollout_corr/kl` is 3.3× the BF16 arm's and rises slowly over the run (0.0017–0.0029 per step; 0.0021
-  on average over steps 2–58, 0.0026 over steps 50–119). Score, entropy and response length follow the BF16 arm with
-  no divergence, through step 119 (the BF16 arm's last) and to the QAT arm's last step, 127.
+- The W4A8 arm's `rollout_corr/kl` is 3.3× the BF16 arm's and rises slowly over the run (0.0017–0.0029 per step;
+  0.0021 on average over steps 2–58, 0.0026 over steps 50–119). Score, entropy and response length follow the BF16
+  arm with no divergence, through step 119 (the BF16 arm's last) and to the W4A8 arm's last step, 127.
+- The W4A16 arm's mismatch equals the BF16 arm's: its rollout experts are exactly the QAT forward's weights.
+- On the same host, W4A8 generation takes 15 % less time than W4A16 (BF16 kernels), and the whole step 3 % less.

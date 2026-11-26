@@ -96,6 +96,20 @@ def test_fp4_grouped_fake_quant_matches_reference():
         assert torch.equal(output[index], _reference(expert, dequant=True))
 
 
+def test_fp4_dequant_decodes_exported_weights_exactly():
+    x = _input((3, 64, 320), torch.Generator(device="cuda").manual_seed(99))
+    quantized, scales = fp4_rocm.fp4_quant(x)
+    expected = fp4_rocm.fp4_quant(x, dequant=True)
+
+    assert torch.equal(fp4_rocm.fp4_dequant(quantized, scales), expected)
+    out = torch.empty_like(x)
+    result = fp4_rocm.fp4_dequant(quantized.view(torch.uint8), scales.view(torch.uint8), out=out)
+    assert result.data_ptr() == out.data_ptr()
+    assert torch.equal(out, expected)
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        fp4_rocm.fp4_dequant(quantized, scales, out=torch.empty(3, 64, 160, device="cuda", dtype=torch.bfloat16))
+
+
 def test_fp4_dispatches_to_aiter_on_rocm():
     generator = torch.Generator(device="cuda").manual_seed(7)
     x = _input((8, 128), generator)

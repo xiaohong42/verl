@@ -19,6 +19,7 @@ TileLang (0.1.10) cannot run ``fp4.py``'s kernels on HIP: ``float8_e8m0fnu`` has
 its "ceil" scaling mode is the same recipe as ``fp4.py``: one E8M0 scale per 32 values,
 ``2^ceil(log2(max(amax, 6 * 2^-126) / 6))``, and E2M1 values rounded to nearest even. Quantization and
 the QAT fake quant share AITER's quantizer, so the exported weights and the QAT forward agree bit for bit.
+``fp4_dequant`` decodes exported weights exactly, for rollouts that run MXFP4 experts in BF16.
 """
 
 import torch
@@ -143,3 +144,77 @@ def fp4_grouped_fake_quant(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
     num_groups, rows, cols = stacked.shape
     _, _, output = _launch(stacked.view(num_groups * rows, cols), quant=False, dequant=True)
     return output.view(num_groups, rows, cols)
+
+
+@triton.jit
+def _mxfp4_dequant_kernel(
+    q_ptr,
+    s_ptr,
+    y_ptr,
+    M,
+    N,
+    stride_q,
+    stride_s,
+    stride_y,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows[:, None] < M
+    rows64 = rows[:, None].to(tl.int64)
+    packed_cols = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+    packed = tl.load(
+        q_ptr + rows64 * stride_q + packed_cols[None, :], mask=row_mask & (packed_cols[None, :] < N // 2), other=0
+    )
+    scale_cols = pid_n * (BLOCK_N // 32) + tl.arange(0, BLOCK_N // 32)
+    scale = tl.load(
+        s_ptr + rows64 * stride_s + scale_cols[None, :], mask=row_mask & (scale_cols[None, :] < N // 32), other=127
+    )
+    values = tl.interleave(_e2m1_to_fp32(packed & 0xF), _e2m1_to_fp32(packed >> 4))
+    # E8M0 -> 2^(e - 127); e = 0 is the subnormal 2^-127
+    scale_fp32 = tl.where(scale == 0, 2.0**-127, (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True))
+    y = tl.reshape(tl.reshape(values, (BLOCK_M, BLOCK_N // 32, 32)) * scale_fp32[:, :, None], (BLOCK_M, BLOCK_N))
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tl.store(
+        y_ptr + rows64 * stride_y + cols[None, :], y.to(y_ptr.dtype.element_ty), mask=row_mask & (cols[None, :] < N)
+    )
+
+
+def fp4_dequant(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Packed E2M1 (two per byte, low nibble first) with E8M0 group scales -> ``dtype``; exact for BF16.
+
+    ``out`` (contiguous, ``[..., 2 * packed.shape[-1]]``) receives the result in place.
+    """
+    packed2d = packed.view(torch.uint8).reshape(-1, packed.shape[-1])
+    scales2d = scales.view(torch.uint8).reshape(-1, scales.shape[-1])
+    rows, cols = packed2d.shape[0], 2 * packed2d.shape[1]
+    if out is None:
+        out = torch.empty((*packed.shape[:-1], cols), dtype=dtype, device=packed.device)
+    if not out.is_contiguous() or out.shape[-1] != cols or out.numel() != rows * cols:
+        raise ValueError(
+            f"out must be contiguous with {rows * cols} elements of last dim {cols}, got {tuple(out.shape)}"
+        )
+    if rows:
+        out2d = out.view(rows, cols)
+        grid = (triton.cdiv(rows, _BLOCK_M), triton.cdiv(cols, _BLOCK_N))
+        _mxfp4_dequant_kernel[grid](
+            packed2d,
+            scales2d,
+            out2d,
+            rows,
+            cols,
+            packed2d.stride(0),
+            scales2d.stride(0),
+            out2d.stride(0),
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            num_warps=4,
+        )
+    return out

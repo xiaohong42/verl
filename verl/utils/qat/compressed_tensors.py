@@ -85,11 +85,18 @@ SUPPORTED_SCHEMES: dict[str, Optional[str]] = {
 # training and NVFP4 QAT do.
 MOE_ACTIVATIONS: dict[str, str] = {
     "nvfp4_per_token": "NVFP4",
+    # MXFP4 expert weights with BF16 expert inputs (W4A16)
+    "bf16": "MXFP4",
 }
 
-# Each override is the only activation scheme verl runs for its preset, and its default:
+# The only activation scheme verl runs for these presets, and their default:
 # NVFP4 has no static activation scales.
-_REQUIRED_MOE_ACTIVATIONS: dict[str, str] = {preset: activation for activation, preset in MOE_ACTIVATIONS.items()}
+_REQUIRED_MOE_ACTIVATIONS: dict[str, str] = {"NVFP4": "nvfp4_per_token"}
+
+# ModelOpt QAT modes of the optional (preset, moe_activation) variants.
+_OPTIONAL_ACTIVATION_QAT_MODES: dict[tuple[str, str], str] = {("MXFP4", "bf16"): "mxfp4_w4a16"}
+
+_MXFP4_VARIANTS = {("MXFP4", None), ("MXFP4", "bf16")}
 
 # Layers that stay in high precision regardless of model. Patterns must start
 # with "re:": vLLM rewrites plain dotted names through the model's
@@ -165,7 +172,8 @@ def qat_modes_for_config(ct_config: Mapping[str, Any]) -> set[Optional[str]]:
     if variants == {("MXFP4", None), ("MXFP8", None)}:
         return {"mxfp4_mxfp8"}
     return {
-        SUPPORTED_SCHEMES[preset] if activation == _REQUIRED_MOE_ACTIVATIONS.get(preset) else None
+        _OPTIONAL_ACTIVATION_QAT_MODES.get((preset, activation))
+        or (SUPPORTED_SCHEMES[preset] if activation == _REQUIRED_MOE_ACTIVATIONS.get(preset) else None)
         for preset, activation in variants
     }
 
@@ -203,6 +211,8 @@ def _scheme_for_preset(preset: str, targets: list[str], moe_activation: Optional
         # Fully dynamic inputs: no static global scale, the kernel derives one per token.
         inputs = scheme.input_activations.model_copy(update={"dynamic": True, "observer": None})
         return scheme.model_copy(update={"input_activations": inputs})
+    if moe_activation == "bf16":
+        return scheme.model_copy(update={"input_activations": None})
     if preset == "MXFP4":
         mxfp8 = preset_name_to_scheme("MXFP8", targets)
         scheme = scheme.model_copy(update={"input_activations": mxfp8.input_activations})
@@ -425,7 +435,7 @@ def _compress_weight(
         )
         return {"weight_scale": scale.view(torch.uint8), "weight": quantized}
 
-    if weight.is_cuda and preset == ("MXFP4", None):
+    if weight.is_cuda and preset in _MXFP4_VARIANTS:
         from verl.utils.qat.fp4 import fp4_quant
 
         quantized, scale = fp4_quant(weight)
@@ -499,7 +509,7 @@ class CompressedTensorsWeightQuantizer:
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Quantize a fused expert tensor once, then emit per-expert parameters."""
         preset = _preset_of(scheme)
-        if preset not in {("FP8_BLOCK", None), ("MXFP8", None), ("MXFP4", None)}:
+        if preset not in {("FP8_BLOCK", None), ("MXFP8", None), *_MXFP4_VARIANTS}:
             raise NotImplementedError(f"Packed expert export does not support scheme {preset}")
         if not tensor.is_cuda or tensor.dtype not in _HIGH_PRECISION_DTYPES:
             raise ValueError("Packed expert export requires a high-precision CUDA tensor")

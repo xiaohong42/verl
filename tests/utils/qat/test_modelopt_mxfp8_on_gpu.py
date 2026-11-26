@@ -152,7 +152,7 @@ def test_tilelang_qat_backend_runs_linear_forward_and_backward(mode):
     assert model.projection.weight.grad is not None
 
 
-@pytest.mark.parametrize("mode", ["fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("mode", ["fp8", "mxfp8", "mxfp4", "mxfp4_w4a16"])
 def test_modelopt_qat_uses_grouped_kernel_for_te_expert_weight_fake_quant(mode):
     import transformer_engine.pytorch as te
 
@@ -191,7 +191,7 @@ def test_modelopt_qat_uses_grouped_kernel_for_te_expert_weight_fake_quant(mode):
     assert projection.weight1.grad is not None
 
 
-@pytest.mark.parametrize("mode", ["fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("mode", ["fp8", "mxfp8", "mxfp4", "mxfp4_w4a16"])
 def test_grouped_expert_weight_fake_quant_matches_per_expert(mode):
     import transformer_engine.pytorch as te
 
@@ -269,6 +269,22 @@ def test_mxfp4_rollout_is_moe_only_w4a8_mx():
             ignore=[],
             config_file=None,
         )
+
+
+def test_mxfp4_bf16_activation_rollout_is_w4a16():
+    config = build_compressed_tensors_config(
+        linear=None, moe="MXFP4", moe_activation="bf16", ignore=[], config_file=None
+    )
+    w4a8 = build_compressed_tensors_config(linear=None, moe="MXFP4", ignore=[], config_file=None)
+
+    scheme = config["config_groups"]["group_moe"]
+    assert scheme["format"] == "mxfp4-pack-quantized"
+    assert scheme["weights"] == w4a8["config_groups"]["group_moe"]["weights"]
+    assert scheme.get("input_activations") is None
+    assert qat_modes_for_config(config) == {"mxfp4_w4a16"}
+
+    with pytest.raises(ValueError, match="moe_activation='bf16'"):
+        build_compressed_tensors_config(linear=None, moe="NVFP4", moe_activation="bf16", ignore=[], config_file=None)
 
 
 def test_mxfp4_rollout_quantizes_packed_experts():
@@ -509,6 +525,19 @@ def test_mxfp4_qat_combines_mxfp4_weights_with_mxfp8_inputs(qat_mode, dense_mxfp
 
     generic_weight_entries = [entry for entry in config["quant_cfg"] if entry["quantizer_name"] == "*weight_quantizer"]
     assert bool(generic_weight_entries) is dense_mxfp8
+
+
+def test_mxfp4_w4a16_qat_quantizes_expert_weights_only():
+    config = build_quantize_config("mxfp4_w4a16")
+    weight_cfg = _entry(config, "*mlp.experts*weight_quantizer")["cfg"]
+
+    assert weight_cfg["num_bits"] == (2, 1)
+    assert weight_cfg["block_sizes"] == {-1: 32, "type": "dynamic", "scale_bits": (8, 0)}
+    assert weight_cfg["backend"] == "verl_mxfp4"
+    names = {entry["quantizer_name"] for entry in config["quant_cfg"]}
+    assert "*mlp.experts*input_quantizer" not in names
+    assert "*weight_quantizer" not in names
+    assert config["algorithm"] is None
 
 
 def test_mxfp4_qat_weight_qdq_exactly_matches_export():

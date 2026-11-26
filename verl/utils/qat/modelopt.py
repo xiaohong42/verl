@@ -181,7 +181,7 @@ _FP8_BLOCK_QUANTIZER_CFG = {
 }
 
 _QUANTIZER_CFGS = {"fp8": _FP8_BLOCK_QUANTIZER_CFG}
-_SUPPORTED_QAT_MODES = {*_QUANTIZER_CFGS, "mxfp8", "mxfp4", "mxfp4_mxfp8", "nvfp4"}
+_SUPPORTED_QAT_MODES = {*_QUANTIZER_CFGS, "mxfp8", "mxfp4", "mxfp4_w4a16", "mxfp4_mxfp8", "nvfp4"}
 
 _ROUTED_EXPERT_WEIGHT_QUANTIZER = "*mlp.experts*weight_quantizer"
 _ROUTED_EXPERT_INPUT_QUANTIZER = "*mlp.experts*input_quantizer"
@@ -204,8 +204,8 @@ def _mxfp8_quantize_config() -> tuple[list[dict], None]:
     return quant_cfg, None
 
 
-def _mxfp4_quantize_config(*, dense_mxfp8: bool) -> tuple[list[dict], None]:
-    """MXFP4 routed-expert weights with MXFP8 activations.
+def _mxfp4_quantize_config(*, dense_mxfp8: bool, mxfp8_inputs: bool = True) -> tuple[list[dict], None]:
+    """MXFP4 routed-expert weights with MXFP8 activations, or BF16 activations (W4A16).
 
     ModelOpt has native MXFP4/MXFP4 and MXFP8/MXFP8 presets but no MXFP4/MXFP8
     preset. Their quantizers are independent, so combine the weight numerics
@@ -220,18 +220,9 @@ def _mxfp4_quantize_config(*, dense_mxfp8: bool) -> tuple[list[dict], None]:
     weight_cfg["backend"] = _MXFP4_BACKEND
     input_cfg = _modelopt_quantizer_cfg(mtq.MXFP8_DEFAULT_CFG, "*input_quantizer")
     input_cfg["backend"] = _MXFP8_BACKEND
-    quant_cfg.extend(
-        [
-            {
-                "quantizer_name": _ROUTED_EXPERT_WEIGHT_QUANTIZER,
-                "cfg": weight_cfg,
-            },
-            {
-                "quantizer_name": _ROUTED_EXPERT_INPUT_QUANTIZER,
-                "cfg": input_cfg,
-            },
-        ]
-    )
+    quant_cfg.append({"quantizer_name": _ROUTED_EXPERT_WEIGHT_QUANTIZER, "cfg": weight_cfg})
+    if mxfp8_inputs:
+        quant_cfg.append({"quantizer_name": _ROUTED_EXPERT_INPUT_QUANTIZER, "cfg": input_cfg})
     return quant_cfg, None
 
 
@@ -281,8 +272,10 @@ def build_quantize_config(
 
     if qat_mode == "mxfp8":
         quant_cfg, algorithm = _mxfp8_quantize_config()
-    elif qat_mode in ("mxfp4", "mxfp4_mxfp8"):
-        quant_cfg, algorithm = _mxfp4_quantize_config(dense_mxfp8=qat_mode == "mxfp4_mxfp8")
+    elif qat_mode in ("mxfp4", "mxfp4_mxfp8", "mxfp4_w4a16"):
+        quant_cfg, algorithm = _mxfp4_quantize_config(
+            dense_mxfp8=qat_mode == "mxfp4_mxfp8", mxfp8_inputs=qat_mode != "mxfp4_w4a16"
+        )
     elif qat_mode == "nvfp4":
         quant_cfg, algorithm = _nvfp4_quantize_config()
     else:

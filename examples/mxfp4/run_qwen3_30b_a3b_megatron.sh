@@ -2,11 +2,13 @@
 # GRPO | Qwen3-30B-A3B (MoE) | DAPO-Math-17k | Megatron training | MXFP4 routed experts | NVIDIA Blackwell (SM100+), AMD gfx950
 #
 # PRECISION=mxfp4_qat trains in BF16 with ModelOpt MXFP4 QAT on the routed experts and serves the rollout with MXFP4
-# experts; PRECISION=mxfp4 quantizes the rollout's experts only (no QAT); PRECISION=bf16 runs the same job in BF16, as
+# experts; PRECISION=mxfp4_w4a16_qat is the same with BF16 expert activations (W4A16) on both sides;
+# PRECISION=mxfp4 quantizes the rollout's experts only (no QAT); PRECISION=bf16 runs the same job in BF16, as
 # the baseline. MXFP4 covers the routed experts only: dense layers, lm_head, embeddings and routers stay in BF16.
 # The rollout serves the experts through vLLM's DeepGEMM FP4 MoE kernel, which needs SM100/SM120; on AMD gfx950
-# (MI350X/MI355X) it serves them through AITER's a8w4 fused MoE. The defaults were tested on one 4xB300 node (4xB200
-# untested) and on one 4xMI350X node, and run without a validation set. See docs/low_precision/mxfp4_qat.md.
+# (MI350X/MI355X) it serves them through AITER's a8w4 fused MoE, and dequantizes the W4A16 experts to BF16. The
+# defaults were tested on one 4xB300 node (4xB200 untested) and on one 4xMI350X node, and run without a validation
+# set. See docs/low_precision/mxfp4_qat.md.
 
 set -xeuo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -70,6 +72,16 @@ case "${PRECISION}" in
             actor_rollout_ref.actor.megatron.qat.mode=mxfp4
         )
         ;;
+    mxfp4_w4a16_qat)
+        PRECISION_ARGS=(
+            # MXFP4 rollout experts with BF16 activations (W4A16)
+            actor_rollout_ref.rollout.quantization.moe=MXFP4
+            actor_rollout_ref.rollout.quantization.moe_activation=bf16
+            # ModelOpt QAT fake-quantizes the routed experts' weights only
+            actor_rollout_ref.actor.megatron.qat.enable=True
+            actor_rollout_ref.actor.megatron.qat.mode=mxfp4_w4a16
+        )
+        ;;
     mxfp4)
         PRECISION_ARGS=(
             actor_rollout_ref.rollout.quantization.moe=MXFP4
@@ -79,7 +91,7 @@ case "${PRECISION}" in
         PRECISION_ARGS=()
         ;;
     *)
-        echo "PRECISION must be mxfp4_qat, mxfp4 or bf16, got '${PRECISION}'" >&2
+        echo "PRECISION must be mxfp4_qat, mxfp4_w4a16_qat, mxfp4 or bf16, got '${PRECISION}'" >&2
         exit 1
         ;;
 esac

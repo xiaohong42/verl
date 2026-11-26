@@ -129,6 +129,11 @@ def install_mxfp4_mxfp8_compressed_tensors_patch():
                 return make_rocm_aiter_mxfp4_moe_method(layer.moe_config)
             logger.info("Using MXFP4 weights with dynamic MXFP8 activations for compressed-tensors MoE")
             return CompressedTensorsW4A8Mxfp4MoEMethod(layer.moe_config)
+        if torch.version.hip is not None and quant_config._is_mxfp4(weight_quant) and input_quant is None:
+            from verl.utils.vllm.vllm_fp4_rocm_utils import make_rocm_aiter_mxfp4_moe_method
+
+            logger.info("Using MXFP4 weights with BF16 activations for compressed-tensors MoE (dequantized to BF16)")
+            return make_rocm_aiter_mxfp4_moe_method(layer.moe_config, "bf16")
         return original(quant_config, layer, layer_name)
 
     CompressedTensorsMoEMethod.get_moe_method = staticmethod(get_moe_method)
